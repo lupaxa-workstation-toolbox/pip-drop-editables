@@ -1,0 +1,76 @@
+#!/bin/bash
+set -eu
+LOG="${PIP_DROP_LOG:-/dev/null}"
+printf '%q' "$0" >>"$LOG"
+for arg in "$@"; do
+    printf ' %q' "$arg" >>"$LOG"
+done
+printf '\n' >>"$LOG"
+
+# Version probe source contains sys.version_info. Any other -c is real
+# Python. Tests exec /usr/bin/python3 for that parse. This is not a pip call.
+if [ "${1:-}" = "-c" ]; then
+    case "${2:-}" in
+    *sys.version_info*)
+        real="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+        if command -v realpath >/dev/null 2>&1; then
+            real="$(realpath "$0")"
+        fi
+        base="$(basename "$0")"
+        if [ -n "${PIP_DROP_VERSION:-}" ]; then
+            ver="$PIP_DROP_VERSION"
+        elif [ "$base" = "python3" ]; then
+            ver="3.13.9"
+        else
+            rest="${base#python3.}"
+            case "$rest" in
+                *.*) ver="3.${rest}" ;;
+                *) ver="3.${rest}.0" ;;
+            esac
+        fi
+        printf '3\n%s\n%s\n' "$ver" "$real"
+        exit 0
+        ;;
+    esac
+    if [ -x /usr/bin/python3 ]; then
+        exec /usr/bin/python3 -c "$2" "${@:3}"
+    fi
+    printf 'fixture has no python for -c\n' >&2
+    exit 99
+fi
+
+if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ]; then
+    if [ "${PIP_DROP_NO_PIP:-0}" = "1" ]; then
+        printf 'No module named pip\n' >&2
+        exit 1
+    fi
+    shift 2
+    if [ "${1:-}" = "list" ]; then
+        printf '%s\n' "${PIP_DROP_JSON:-[]}"
+        exit 0
+    fi
+    if [ "${1:-}" = "uninstall" ]; then
+        name=""
+        for arg in "$@"; do
+            case "$arg" in
+                -y|--disable-pip-version-check) ;;
+                *) name="$arg" ;;
+            esac
+        done
+        printf 'uninstall %s\n' "$name" >>"${PIP_DROP_ACTIONS:-/dev/null}"
+        exit "${PIP_DROP_UNINSTALL_STATUS:-0}"
+    fi
+    if [ "${1:-}" = "cache" ]; then
+        printf 'purge\n' >>"${PIP_DROP_ACTIONS:-/dev/null}"
+        exit 0
+    fi
+fi
+
+if [ "${1:-}" = "-" ]; then
+    cat >/dev/null
+    printf '%s\n' "${PIP_DROP_INDEX_LINE:-unavailable timeout}"
+    exit 0
+fi
+
+printf 'fixture cannot handle: %s\n' "$*" >&2
+exit 99

@@ -1,0 +1,915 @@
+#!/bin/bash
+#
+# pip-drop-editables — uninstall editable pip installs so `pip install -U`
+# can take a published release.
+#
+# One Bash 3.2 executable. Checkouts stay on disk. Dependencies stay
+# installed. A package that is not an editable is never removed. Each
+# chosen interpreter runs its own `python -m pip`, always with
+# `--disable-pip-version-check`.
+#
+# Discovery uses `python3` and `python3.*` on PATH. A pyenv shims
+# directory also contributes each version install under the sibling
+# `versions` directory. The same real interpreter (`sys.executable`)
+# counts once. A venv is selected only with `--python PATH`.
+#
+# The Python question and the uninstall question are read from /dev/tty.
+# Without a terminal, a required question exits 2. `-y` skips only the
+# uninstall question. `-n` prints the drop and uninstalls nothing.
+#
+# Exit status:
+#   0  success, nothing to do, cancel, dry-run, or a check with no editables
+#   1  an uninstall or pip failure, or `--check` found an editable
+#   2  usage
+#
+# shellcheck shell=bash
+set -euo pipefail
+
+PIP_DROP_EDITABLES_VERSION="0.0.0"
+
+# Paths from new_temp. The EXIT trap removes them. The files hold package
+# names and checkout paths, so they must not survive the process.
+TEMP_FILES=()
+
+new_temp() {
+    local path
+    path="$(mktemp)"
+    TEMP_FILES+=("$path")
+    NEW_TEMP="$path"
+}
+
+# Invoked from the EXIT trap. Shellcheck does not count that as a call.
+# shellcheck disable=SC2329
+cleanup_temp_files() {
+    local idx=0
+    while [ "$idx" -lt "${#TEMP_FILES[@]}" ]; do
+        rm -f "${TEMP_FILES[$idx]}"
+        idx=$((idx + 1))
+    done
+}
+
+trap cleanup_temp_files EXIT
+
+usage() {
+    cat <<'EOF'
+Usage: pip-drop-editables [options] [package ...]
+
+Uninstall editable pip installs on a chosen Python. Checkouts stay on disk.
+Dependencies stay installed. A package that is not editable is never removed.
+
+  --list                 Show editable installs and stop
+  --check                Report editables that block pip install -U
+  --index                With --check, ask the package index for a release
+  -n, --dry-run          Show the uninstall and stop
+  -y, --yes              Uninstall without asking
+      --purge-cache      After a real uninstall, run pip cache purge
+      --python PATH      Use this interpreter and skip the version question
+      --python-version X Use installed X, such as 3.12
+      --all              Every Python on PATH, plus pyenv installs
+      --version          Print the tool version
+  -h, --help             Show this help
+EOF
+}
+
+# MODE is drop, list, or check. The three selectors do not combine.
+MODE="drop"
+DO_INDEX=0
+DRY_RUN=0
+ASSUME_YES=0
+PURGE_CACHE=0
+PYTHON_PATH=""
+PYTHON_VERSION=""
+ALL_PYTHONS=0
+PACKAGES=()
+
+die_usage() {
+    printf '%s\n\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+parse_args() {
+    # shellcheck disable=SC2034
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --version)
+                printf 'pip-drop-editables %s\n' "$PIP_DROP_EDITABLES_VERSION"
+                exit 0
+                ;;
+            --list)
+                [ "$MODE" = "drop" ] || die_usage "--list, --check, and a drop do not combine."
+                MODE="list"
+                ;;
+            --check)
+                [ "$MODE" = "drop" ] || die_usage "--list, --check, and a drop do not combine."
+                MODE="check"
+                ;;
+            --index)
+                DO_INDEX=1
+                ;;
+            -n|--dry-run)
+                DRY_RUN=1
+                ;;
+            -y|--yes)
+                ASSUME_YES=1
+                ;;
+            --purge-cache)
+                PURGE_CACHE=1
+                ;;
+            --python)
+                shift
+                [ "$#" -gt 0 ] || die_usage "--python needs a path."
+                PYTHON_PATH="$1"
+                ;;
+            --python-version)
+                shift
+                [ "$#" -gt 0 ] || die_usage "--python-version needs a version."
+                PYTHON_VERSION="$1"
+                ;;
+            --all)
+                ALL_PYTHONS=1
+                ;;
+            --)
+                shift
+                while [ "$#" -gt 0 ]; do
+                    PACKAGES+=("$1")
+                    shift
+                done
+                break
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                PACKAGES+=("$1")
+                ;;
+        esac
+        shift
+    done
+    if [ "$DO_INDEX" -eq 1 ] && [ "$MODE" != "check" ]; then
+        die_usage "--index belongs with --check."
+    fi
+    selectors=0
+    [ -n "$PYTHON_PATH" ] && selectors=$((selectors + 1))
+    [ -n "$PYTHON_VERSION" ] && selectors=$((selectors + 1))
+    [ "$ALL_PYTHONS" -eq 1 ] && selectors=$((selectors + 1))
+    if [ "$selectors" -gt 1 ]; then
+        die_usage "Use only one of --python, --python-version, and --all."
+    fi
+}
+
+parse_args "$@"
+
+# Three lines: major, major.minor.patch, and the real path of the
+# interpreter that ran. The test fixture recognises this source by
+# `sys.version_info` and returns a canned version instead.
+version_probe='import os, sys
+print(sys.version_info[0])
+print("%d.%d.%d" % sys.version_info[:3])
+print(os.path.realpath(sys.executable))'
+
+probe_python() {
+    bin="$1"
+    [ -x "$bin" ] || return 1
+    probe="$("$bin" -c "$version_probe" "$bin" 2>/dev/null)" || return 1
+    major="$(printf '%s\n' "$probe" | sed -n '1p')"
+    ver="$(printf '%s\n' "$probe" | sed -n '2p')"
+    real="$(printf '%s\n' "$probe" | sed -n '3p')"
+    [ "$major" = "3" ] || return 1
+    [ -n "$ver" ] && [ -n "$real" ] || return 1
+    PY_BIN+=("$bin")
+    PY_VER+=("$ver")
+    PY_REAL+=("$real")
+}
+
+is_python3_name() {
+    case "$1" in
+        python3) return 0 ;;
+        python3.*)
+            rest="${1#python3.}"
+            case "$rest" in
+                *[!0-9.]*) return 1 ;;
+                *.*.*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+probe_dir() {
+    dir="$1"
+    [ -n "$dir" ] || return 0
+    [ -d "$dir" ] || return 0
+    for bin in "$dir"/python3 "$dir"/python3.*; do
+        [ -x "$bin" ] || continue
+        is_python3_name "$(basename "$bin")" || continue
+        probe_python "$bin" || true
+    done
+}
+
+# Pyenv shims only run the selected version. The other installs live in the
+# sibling versions directory and are real interpreters, not venvs.
+discover_pyenv_dir() {
+    dir="$1"
+    [ -n "$dir" ] || return 0
+    [ "$(basename "$dir")" = "shims" ] || return 0
+    root="$(dirname "$dir")"
+    [ -d "$root/versions" ] || return 0
+    case "$PYENV_ROOTS_SEEN" in
+        *" $root "*) return 0 ;;
+    esac
+    PYENV_ROOTS_SEEN="${PYENV_ROOTS_SEEN} ${root} "
+    for verdir in "$root"/versions/*; do
+        [ -d "$verdir" ] || continue
+        [ -e "$verdir/pyvenv.cfg" ] && continue
+        case "$(basename "$verdir")" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) continue ;;
+        esac
+        probe_dir "$verdir/bin"
+    done
+}
+
+discover_pythons() {
+    PY_BIN=()
+    PY_VER=()
+    PY_REAL=()
+    PYENV_ROOTS_SEEN=" "
+    old_ifs="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2086
+    set -- $PATH
+    IFS="$old_ifs"
+    for dir in "$@"; do
+        probe_dir "$dir"
+    done
+    for dir in "$@"; do
+        discover_pyenv_dir "$dir"
+    done
+}
+
+already_real() {
+    needle="$1"
+    local idx=0
+    while [ "$idx" -lt "${#SEEN_REAL[@]}" ]; do
+        [ "${SEEN_REAL[$idx]}" = "$needle" ] && return 0
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+unique_targets() {
+    TARGET_BIN=()
+    TARGET_VER=()
+    TARGET_REAL=()
+    SEEN_REAL=()
+    idx=0
+    while [ "$idx" -lt "${#PY_BIN[@]}" ]; do
+        if ! already_real "${PY_REAL[$idx]}"; then
+            SEEN_REAL+=("${PY_REAL[$idx]}")
+            TARGET_BIN+=("${PY_BIN[$idx]}")
+            TARGET_VER+=("${PY_VER[$idx]}")
+            TARGET_REAL+=("${PY_REAL[$idx]}")
+        fi
+        idx=$((idx + 1))
+    done
+}
+
+version_minor() {
+    local ver="$1"
+    local major="${ver%%.*}"
+    local rest="${ver#*.}"
+    local minor="${rest%%.*}"
+    printf '%s.%s\n' "$major" "$minor"
+}
+
+is_version_token() {
+    case "$1" in
+        *[!0-9.]*) return 1 ;;
+        *.*.*.*) return 1 ;;
+        *.*.*) return 0 ;;
+        *.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_current() {
+    local idx=0
+    local base=""
+    CURRENT_BIN=""
+    CURRENT_VER=""
+    CURRENT_REAL=""
+    while [ "$idx" -lt "${#PY_BIN[@]}" ]; do
+        base="$(basename "${PY_BIN[$idx]}")"
+        if [ "$base" = "python3" ]; then
+            CURRENT_BIN="${PY_BIN[$idx]}"
+            CURRENT_VER="${PY_VER[$idx]}"
+            CURRENT_REAL="${PY_REAL[$idx]}"
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+label_for_real() {
+    local real="$1"
+    local is_current="$2"
+    local label="" idx=0 base="" minor="" seen=" "
+    if [ "$is_current" -eq 1 ]; then
+        label="current"
+    fi
+    while [ "$idx" -lt "${#PY_BIN[@]}" ]; do
+        if [ "${PY_REAL[$idx]}" = "$real" ]; then
+            base="$(basename "${PY_BIN[$idx]}")"
+            if [ "$base" != "python3" ]; then
+                minor="$(version_minor "${PY_VER[$idx]}")"
+                case "$seen" in
+                    *" ${minor} "*) ;;
+                    *)
+                        seen="${seen}${minor} "
+                        if [ -n "$label" ]; then
+                            label="${label}, ${minor}"
+                        else
+                            label="${minor}"
+                        fi
+                        ;;
+                esac
+            fi
+        fi
+        idx=$((idx + 1))
+    done
+    if [ -z "$label" ]; then
+        label="python"
+    fi
+    printf '%s\n' "$label"
+}
+
+build_rows() {
+    local idx=0 real="" label=""
+    ROW_LABEL=()
+    ROW_VER=()
+    ROW_BIN=()
+    find_current || true
+    if [ -n "$CURRENT_REAL" ]; then
+        label="$(label_for_real "$CURRENT_REAL" 1)"
+        ROW_LABEL+=("$label")
+        ROW_VER+=("$CURRENT_VER")
+        ROW_BIN+=("$CURRENT_BIN")
+    fi
+    while [ "$idx" -lt "${#TARGET_REAL[@]}" ]; do
+        real="${TARGET_REAL[$idx]}"
+        if [ -z "$CURRENT_REAL" ] || [ "$real" != "$CURRENT_REAL" ]; then
+            label="$(label_for_real "$real" 0)"
+            ROW_LABEL+=("$label")
+            ROW_VER+=("${TARGET_VER[$idx]}")
+            ROW_BIN+=("${TARGET_BIN[$idx]}")
+        fi
+        idx=$((idx + 1))
+    done
+}
+
+print_python_rows() {
+    local idx=0 label_width=0 ver_width=0 label_len=0 ver_len=0
+    build_rows
+    while [ "$idx" -lt "${#ROW_LABEL[@]}" ]; do
+        label_len="${#ROW_LABEL[$idx]}"
+        ver_len="${#ROW_VER[$idx]}"
+        if [ "$label_len" -gt "$label_width" ]; then
+            label_width="$label_len"
+        fi
+        if [ "$ver_len" -gt "$ver_width" ]; then
+            ver_width="$ver_len"
+        fi
+        idx=$((idx + 1))
+    done
+    printf 'Pythons on PATH:\n\n'
+    idx=0
+    while [ "$idx" -lt "${#ROW_LABEL[@]}" ]; do
+        printf '  %-*s  %-*s  %s\n' \
+            "$label_width" "${ROW_LABEL[$idx]}" \
+            "$ver_width" "${ROW_VER[$idx]}" \
+            "${ROW_BIN[$idx]}"
+        idx=$((idx + 1))
+    done
+}
+
+select_current() {
+    find_current || {
+        printf 'python3 was not found in PATH.\n' >&2
+        exit 1
+    }
+    TARGET_BIN=("$CURRENT_BIN")
+    TARGET_VER=("$CURRENT_VER")
+    TARGET_REAL=("$CURRENT_REAL")
+}
+
+select_version() {
+    local want="$1"
+    local mode="" idx=0 ver="" hit=0
+    local -a new_bin=()
+    local -a new_ver=()
+    local -a new_real=()
+    case "$want" in
+        *[!0-9.]*) mode="bad" ;;
+        *.*.*.*) mode="bad" ;;
+        *.*.*) mode="exact" ;;
+        *.*) mode="minor" ;;
+        *) mode="bad" ;;
+    esac
+    if [ "$mode" = "bad" ]; then
+        printf 'Python version must be major.minor or major.minor.patch.\n' >&2
+        exit 2
+    fi
+    while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+        ver="${TARGET_VER[$idx]}"
+        hit=0
+        if [ "$mode" = "exact" ]; then
+            [ "$ver" = "$want" ] && hit=1
+        else
+            case "$ver" in
+                "$want"|"$want".*) hit=1 ;;
+            esac
+        fi
+        if [ "$hit" -eq 1 ]; then
+            new_bin+=("${TARGET_BIN[$idx]}")
+            new_ver+=("${TARGET_VER[$idx]}")
+            new_real+=("${TARGET_REAL[$idx]}")
+        fi
+        idx=$((idx + 1))
+    done
+    if [ "${#new_bin[@]}" -eq 0 ]; then
+        printf 'No Python %s on PATH.\n' "$want" >&2
+        exit 2
+    fi
+    if [ "${#new_bin[@]}" -gt 1 ]; then
+        printf 'More than one Python matches %s. pass --python\n' "$want" >&2
+        exit 2
+    fi
+    TARGET_BIN=("${new_bin[@]}")
+    TARGET_VER=("${new_ver[@]}")
+    TARGET_REAL=("${new_real[@]}")
+}
+
+ask_python() {
+    local answer=""
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        print_python_rows >&2
+        exit 2
+    fi
+    print_python_rows >&3
+    printf '\nWhich Python? [current] ' >&3
+    if ! IFS= read -r answer <&3; then
+        exec 3<&-
+        printf 'Left in place.\n'
+        exit 0
+    fi
+    exec 3<&-
+    answer="${answer%$'\r'}"
+    case "$answer" in
+        ""|current)
+            select_current
+            ;;
+        all)
+            ;;
+        *)
+            if is_version_token "$answer"; then
+                select_version "$answer"
+            else
+                printf 'Left in place.\n'
+                exit 0
+            fi
+            ;;
+    esac
+}
+
+choose_targets() {
+    discover_pythons
+    TARGET_BIN=()
+    TARGET_VER=()
+    TARGET_REAL=()
+    if [ -n "$PYTHON_PATH" ]; then
+        [ -x "$PYTHON_PATH" ] || die_usage "--python is not executable: $PYTHON_PATH"
+        probe_python "$PYTHON_PATH" || die_usage "--python is not Python 3: $PYTHON_PATH"
+        TARGET_BIN=("$PYTHON_PATH")
+        TARGET_VER=("$ver")
+        TARGET_REAL=("$real")
+        return 0
+    fi
+    unique_targets
+    if [ "${#TARGET_BIN[@]}" -eq 0 ]; then
+        printf 'python3 was not found in PATH.\n' >&2
+        exit 1
+    fi
+    if [ "$ALL_PYTHONS" -eq 1 ]; then
+        return 0
+    fi
+    if [ -n "$PYTHON_VERSION" ]; then
+        select_version "$PYTHON_VERSION"
+        return 0
+    fi
+    if [ "${#TARGET_BIN[@]}" -eq 1 ]; then
+        return 0
+    fi
+    ask_python
+}
+
+# --- Editables ---
+# `pip list --editable --format=json` on each chosen interpreter. The TSV
+# columns are name, version, checkout, and interpreter. Empty fields stay
+# empty. Rows are read on fd 4 so a later pip command does not inherit the
+# file as its stdin.
+
+editable_tsv() {
+    out="$1"
+    bin="$2"
+    json="$("$bin" -m pip list --editable --format=json --disable-pip-version-check)" || {
+        printf 'pip list failed for %s\n' "$bin" >&2
+        return 1
+    }
+    printf '%s' "$json" | "$bin" -c '
+import json, sys
+rows = json.load(sys.stdin)
+rows.sort(key=lambda item: item["name"].lower())
+py = sys.argv[1]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    for item in rows:
+        name = item["name"]
+        version = item.get("version", "")
+        loc = item.get("editable_project_location") or ""
+        handle.write("%s\t%s\t%s\t%s\n" % (name, version, loc, py))
+' "$bin" "$out"
+}
+
+fold_name() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+name_was_requested() {
+    local folded="$1"
+    local idx=0
+    local key=""
+    if [ "${#PACKAGES[@]}" -eq 0 ]; then
+        return 0
+    fi
+    while [ "$idx" -lt "${#PACKAGES[@]}" ]; do
+        key="$(fold_name "${PACKAGES[$idx]}")"
+        if [ "$key" = "$folded" ]; then
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+# Tab is IFS whitespace, so `read` would drop an empty version or location.
+split_tsv_row() {
+    local line="$1"
+    local rest="$line"
+    name="${rest%%$'\t'*}"
+    case "$rest" in
+        *$'\t'*) rest="${rest#*$'\t'}" ;;
+        *)
+            version=""
+            loc=""
+            py=""
+            return 0
+            ;;
+    esac
+    version="${rest%%$'\t'*}"
+    case "$rest" in
+        *$'\t'*) rest="${rest#*$'\t'}" ;;
+        *)
+            loc=""
+            py=""
+            return 0
+            ;;
+    esac
+    loc="${rest%%$'\t'*}"
+    case "$rest" in
+        *$'\t'*) rest="${rest#*$'\t'}" ;;
+        *)
+            py=""
+            return 0
+            ;;
+    esac
+    py="$rest"
+}
+
+filter_editables() {
+    local src="$1"
+    local dest="$2"
+    local line="" name="" version="" loc="" py="" folded="" key="" idx=0 found=0
+    : >"$dest"
+    while [ "$idx" -lt "${#PACKAGES[@]}" ]; do
+        folded="$(fold_name "${PACKAGES[$idx]}")"
+        found=0
+        while IFS= read -r line <&4; do
+            [ -n "${line:-}" ] || continue
+            split_tsv_row "$line"
+            [ -n "${name:-}" ] || continue
+            key="$(fold_name "$name")"
+            if [ "$key" = "$folded" ]; then
+                found=1
+                break
+            fi
+        done 4<"$src"
+        if [ "$found" -eq 0 ]; then
+            printf '%s is not an editable install\n' "${PACKAGES[$idx]}" >&2
+            exit 2
+        fi
+        idx=$((idx + 1))
+    done
+    while IFS= read -r line <&4; do
+        [ -n "${line:-}" ] || continue
+        split_tsv_row "$line"
+        [ -n "${name:-}" ] || continue
+        folded="$(fold_name "$name")"
+        if name_was_requested "$folded"; then
+            printf '%s\t%s\t%s\t%s\n' "$name" "$version" "$loc" "$py" >>"$dest"
+        fi
+    done 4<"$src"
+}
+
+# --- Drop ---
+# One confirmation for the whole selection. Only y, Y, yes, and YES
+# continue. Any other answer, including end of file, leaves the installs
+# in place and exits 0.
+
+ask_uninstall() {
+    local count="$1"
+    local answer=""
+    if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+        printf 'No terminal is available to confirm the uninstall.\n' >&2
+        exit 2
+    fi
+    printf '\nUninstall these %s editable installs? [y/N]: ' "$count" >&3
+    if ! IFS= read -r answer <&3; then
+        exec 3<&-
+        printf 'Left in place.\n'
+        exit 0
+    fi
+    exec 3<&-
+    answer="${answer%$'\r'}"
+    case "$answer" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            printf 'Left in place.\n'
+            exit 0
+            ;;
+    esac
+}
+
+print_drop_success() {
+    printf '\nRemoved editable installs.\n'
+    printf 'Checkouts on disk were not deleted. Dependencies were left installed.\n'
+    printf 'Install a published release with:\n'
+    printf '  python -m pip install -U <name>\n'
+    if [ "$PURGE_CACHE" -eq 0 ]; then
+        printf 'If that release is only a minute old, pip may still be holding the index page:\n'
+        printf '  python -m pip install -U --no-cache-dir <name>\n'
+        printf 'or rerun: pip-drop-editables --purge-cache\n'
+    fi
+}
+
+print_editables() {
+    local tsv="$1"
+    local line=""
+    EDITABLE_COUNT=0
+    current_py=""
+    # shellcheck disable=SC2094
+    while IFS= read -r line <&4; do
+        [ -n "${line:-}" ] || continue
+        split_tsv_row "$line"
+        [ -n "${name:-}" ] || continue
+        if [ "$py" != "$current_py" ]; then
+            ver=""
+            idx=0
+            while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+                if [ "${TARGET_BIN[$idx]}" = "$py" ]; then
+                    ver="${TARGET_VER[$idx]}"
+                fi
+                idx=$((idx + 1))
+            done
+            printf '\nPython: %s (%s)\n\n' "$py" "$ver"
+            current_py="$py"
+            group=0
+            # count this group
+            group="$(awk -F '\t' -v py="$py" '$4==py { n++ } END { print n+0 }' "$tsv")"
+            printf 'Editable installs (%s):\n\n' "$group"
+        fi
+        printf '  %-42s %s\n' "$name" "$version"
+        printf '    %s\n' "$loc"
+        EDITABLE_COUNT=$((EDITABLE_COUNT + 1))
+    done 4<"$tsv"
+}
+
+# --- Check ---
+# `--check` does not uninstall and does not purge. With `--index`, that
+# interpreter's standard library reads the simple index (PIP_INDEX_URL, or
+# https://pypi.org/simple). The program prints one line: `published VERSION`,
+# `unavailable REASON`, or `unparsed`. A failure on one package does not
+# skip the rest. The block line is printed either way.
+
+read_index_line() {
+    local bin="$1"
+    local name="$2"
+    local index_url="${PIP_INDEX_URL:-https://pypi.org/simple}"
+    local line=""
+    line="$(
+        "$bin" - "$index_url" "$name" <<'PY'
+import json
+import re
+import sys
+import urllib.request
+
+index = sys.argv[1].rstrip("/")
+name = re.sub(r"[-_.]+", "-", sys.argv[2]).lower()
+url = index + "/" + name
+request = urllib.request.Request(
+    url,
+    headers={"Accept": "application/vnd.pypi.simple.v1+json"},
+)
+try:
+    with urllib.request.urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except Exception as exc:
+    sys.stdout.write("unavailable %s\n" % exc.__class__.__name__)
+    raise SystemExit(0)
+
+versions = payload.get("versions") or []
+stables = []
+for raw in versions:
+    base = raw.split("+", 1)[0]
+    if re.search(r"(?:a|b|rc|alpha|beta|preview|dev|c)\d*$", base, re.I):
+        continue
+    parts = base.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        continue
+    stables.append((tuple(int(part) for part in parts), raw.split("+", 1)[0]))
+
+if not stables:
+    sys.stdout.write("unparsed\n")
+    raise SystemExit(0)
+
+def key(item):
+    nums = item[0]
+    return nums + (0,) * (8 - len(nums))
+
+best = max(stables, key=key)
+sys.stdout.write("published %s\n" % best[1])
+PY
+    )" || line="unavailable failed"
+    printf '%s\n' "$line"
+}
+
+print_check() {
+    local tsv="$1"
+    local name="" version="" loc="" py=""
+    local current_py="" ver="" idx=0
+    local index_line=""
+    local line=""
+    EDITABLE_COUNT=0
+    while IFS= read -r line <&4; do
+        [ -n "${line:-}" ] || continue
+        split_tsv_row "$line"
+        [ -n "${name:-}" ] || continue
+        if [ "$py" != "$current_py" ]; then
+            ver=""
+            idx=0
+            while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+                if [ "${TARGET_BIN[$idx]}" = "$py" ]; then
+                    ver="${TARGET_VER[$idx]}"
+                fi
+                idx=$((idx + 1))
+            done
+            printf '\nPython: %s (%s)\n\n' "$py" "$ver"
+            current_py="$py"
+        fi
+        printf '  %-42s %s\n' "$name" "$version"
+        printf '    %s\n' "$loc"
+        if [ "$DO_INDEX" -eq 1 ]; then
+            index_line="$(read_index_line "$py" "$name")" || index_line="unavailable failed"
+            case "$index_line" in
+                published\ *)
+                    printf '    %s\n' "$index_line"
+                    ;;
+                unparsed)
+                    printf '    unparsed\n'
+                    ;;
+                *)
+                    printf '    index: unavailable\n'
+                    ;;
+            esac
+        fi
+        printf '    blocks pip install -U\n'
+        EDITABLE_COUNT=$((EDITABLE_COUNT + 1))
+    done 4<"$tsv"
+}
+
+# Only a real drop. Still runs when the editable list was empty and when
+# an uninstall failed. List, check, and dry-run never reach this.
+purge_chosen_caches() {
+    [ "$MODE" = "drop" ] && [ "$DRY_RUN" -eq 0 ] && [ "$PURGE_CACHE" -eq 1 ] || return 0
+    idx=0
+    while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+        if ! "${TARGET_BIN[$idx]}" -m pip cache purge --disable-pip-version-check; then
+            failures=$((failures + 1))
+        fi
+        idx=$((idx + 1))
+    done
+}
+
+exit_for_failures() {
+    if [ "$failures" -ne 0 ]; then
+        exit 1
+    fi
+}
+
+# List and check return before any uninstall. A non-zero `failures` count
+# exits 1 after the work for every chosen interpreter has been attempted.
+run_drop_or_list() {
+    new_temp
+    tsv="$NEW_TEMP"
+    : >"$tsv"
+    failures=0
+    idx=0
+    while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+        new_temp
+        part="$NEW_TEMP"
+        if ! editable_tsv "$part" "${TARGET_BIN[$idx]}"; then
+            failures=$((failures + 1))
+        fi
+        cat "$part" >>"$tsv"
+        rm -f "$part"
+        idx=$((idx + 1))
+    done
+    count="$(grep -c . "$tsv" || true)"
+    if [ "$MODE" = "list" ]; then
+        if [ "$count" -eq 0 ]; then
+            idx=0
+            while [ "$idx" -lt "${#TARGET_BIN[@]}" ]; do
+                printf '\nPython: %s (%s)\n\n' "${TARGET_BIN[$idx]}" "${TARGET_VER[$idx]}"
+                idx=$((idx + 1))
+            done
+            printf 'No editable installs.\n'
+        else
+            print_editables "$tsv"
+        fi
+        exit_for_failures
+        exit 0
+    fi
+    if [ "$MODE" = "check" ]; then
+        if [ "$count" -eq 0 ]; then
+            printf 'No editable installs.\n'
+            exit_for_failures
+            exit 0
+        fi
+        print_check "$tsv"
+        if [ "${EDITABLE_COUNT:-0}" -gt 0 ]; then
+            exit 1
+        fi
+        exit_for_failures
+        exit 0
+    fi
+    if [ "$count" -eq 0 ]; then
+        printf 'No editable installs.\n'
+        purge_chosen_caches
+        exit_for_failures
+        exit 0
+    fi
+    new_temp
+    filtered="$NEW_TEMP"
+    filter_editables "$tsv" "$filtered"
+    print_editables "$filtered"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '\nDry run. Nothing uninstalled.\n'
+        exit_for_failures
+        exit 0
+    fi
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        ask_uninstall "$EDITABLE_COUNT"
+    fi
+    line=""
+    while IFS= read -r line <&4; do
+        [ -n "${line:-}" ] || continue
+        split_tsv_row "$line"
+        [ -n "${name:-}" ] || continue
+        if ! "$py" -m pip uninstall -y --disable-pip-version-check "$name"; then
+            failures=$((failures + 1))
+        fi
+    done 4<"$filtered"
+    purge_chosen_caches
+    exit_for_failures
+    print_drop_success
+    exit 0
+}
+
+choose_targets
+run_drop_or_list
