@@ -25,7 +25,7 @@
 # shellcheck shell=bash
 set -euo pipefail
 
-PIP_DROP_EDITABLES_VERSION="0.1.0-rc1"
+PIP_DROP_EDITABLES_VERSION="0.1.0"
 
 # Paths from new_temp. The EXIT trap removes them. The files hold package
 # names and checkout paths, so they must not survive the process.
